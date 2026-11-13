@@ -82,7 +82,7 @@ async function runFile(file, deadlineMs) {
         return;
       }
 
-      resolve({ status: code, stdout, trace });
+      resolve({ status: code, stdout, stderr, trace });
     });
   });
 }
@@ -295,6 +295,16 @@ function expectCleanCapture(result) {
   return { report, thread };
 }
 
+// The diagnostics line the module writes to stderr for the given state kind
+function serializationLog(result, state) {
+  const lines = result.stderr
+    .filter(line => line.startsWith('{') && line.includes('sentryNativeStacktrace'))
+    .map(line => JSON.parse(line))
+    .filter(log => log.sentryNativeStacktrace.state === state);
+  expect(lines).toHaveLength(1);
+  return lines[0];
+}
+
 function follow(value, key, hops) {
   for (let i = 0; i < hops; i++) {
     value = value[key];
@@ -390,6 +400,38 @@ describe('bounded state serialization', { timeout }, () => {
       expect(chain.length).toBeGreaterThan(0);
       expect(chain.length).toBeLessThan(10);
     }
+  });
+
+  asyncStateTest('a used-up read budget is logged as a warning with the path where it ran out', async () => {
+    const result = await runBounded('bounded-node-budget.mjs');
+    expectCleanCapture(result);
+
+    const log = serializationLog(result, 'asyncState');
+    expect(log.severity).toEqual('WARNING');
+    const details = log.sentryNativeStacktrace;
+    expect(details.reads).toEqual(20000);
+    expect(details.readBudgetCuts.count).toBeGreaterThan(0);
+    expect(details.readBudgetCuts.firstPath).toMatch(/^graph\[0\]/);
+    expect(details.heavyPaths).toEqual(expect.arrayContaining([{ path: 'graph', reads: expect.any(Number) }]));
+  });
+
+  asyncStateTest('depth cuts alone are logged as info with the first cut path', async () => {
+    const result = await runBounded('bounded-timers.mjs');
+    expectCleanCapture(result);
+
+    const log = serializationLog(result, 'asyncState');
+    expect(log.severity).toEqual('INFO');
+    const details = log.sentryNativeStacktrace;
+    expect(details.readBudgetCuts.count).toEqual(0);
+    expect(details.depthCuts.count).toBeGreaterThan(0);
+    expect(details.depthCuts.firstPath).toMatch(/^profiler\._chunkData\.timer\._idle(Prev|Next)\./);
+  });
+
+  asyncStateTest('a small state is not logged', async () => {
+    const result = await runBounded('bounded-throwing.mjs');
+    expectCleanCapture(result);
+
+    expect(result.stderr.filter(line => line.includes('sentryNativeStacktrace'))).toEqual([]);
   });
 
   asyncStateTest('exceptions while reading the state do not reach the application', async () => {

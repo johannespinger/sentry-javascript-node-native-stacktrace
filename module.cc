@@ -1,9 +1,12 @@
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <future>
 #include <mutex>
 #include <node.h>
 #include <node_version.h>
 #include <optional>
+#include <string>
 #include <vector>
 
 // Platform-specific includes for time functions
@@ -57,6 +60,24 @@ static const uint32_t kMaxStateNodes = 20000;
 // become "[String]", and an object whose next key does not fit ends with a
 // "...": "[MaxProperties ~]" entry.
 static const uint32_t kMaxStateStringLength = 1024 * 1024;
+
+// Serialization diagnostics are written as one JSON line to stderr (picked up
+// as a structured log entry by e.g. Google Cloud Logging) when a limit cut the
+// state or the serialization took at least kSlowStateMs. The line names the
+// first path cut by each limit and the subtrees that used the most reads, so
+// the part of the state that grew too large can be found.
+static const double kSlowStateMs = 50;
+// Subtrees at most this many keys below the root are reported if they used at
+// least kHeavyPathReads reads
+static const size_t kHeavyPathMaxKeys = 4;
+static const uint32_t kHeavyPathReads = 1000;
+static const size_t kMaxHeavyPaths = 16;
+// Paths are cut to keep the log line short
+static const size_t kMaxPathKeyLength = 64;
+static const size_t kMaxPathLength = 400;
+// At most one log line per kind of state in this interval; the poll state is
+// serialized several times per second.
+static const int64_t kMinLogIntervalMs = 10 * 60 * 1000;
 
 struct AsyncLocalStorageLookup {
   // Async local storage instance associated with this thread
@@ -138,7 +159,167 @@ struct SanitizeState {
   uint32_t remaining_string_length = kMaxStateStringLength;
   // Set when execution is terminating; the walk must not call into V8 anymore
   bool terminating = false;
+
+  // Diagnostics, see kSlowStateMs
+  // Keys (strings or array indices) from the root to the current value
+  std::vector<v8::Local<v8::Value>> path;
+  uint32_t depth_cuts = 0;
+  uint32_t breadth_cuts = 0;
+  uint32_t read_cuts = 0;
+  uint32_t string_cuts = 0;
+  std::string first_depth_cut;
+  std::string first_breadth_cut;
+  std::string first_read_cut;
+  std::string first_string_cut;
+  std::vector<std::pair<std::string, uint32_t>> heavy_paths;
 };
+
+// Formats the current path as a.b[0].c, cut to kMaxPathLength
+static std::string PathString(v8::Isolate *isolate,
+                              const SanitizeState &state) {
+  std::string out;
+  for (auto &key : state.path) {
+    if (out.size() >= kMaxPathLength) {
+      out += "~";
+      break;
+    }
+    if (key->IsNumber()) {
+      out += "[" +
+             std::to_string(
+                 key.As<v8::Number>()->Value() >= 0
+                     ? static_cast<uint64_t>(key.As<v8::Number>()->Value())
+                     : 0) +
+             "]";
+      continue;
+    }
+    v8::String::Utf8Value utf8(isolate, key);
+    std::string part = *utf8 ? std::string(*utf8, utf8.length()) : "?";
+    if (part.size() > kMaxPathKeyLength) {
+      part = part.substr(0, kMaxPathKeyLength) + "~";
+    }
+    if (!out.empty()) {
+      out += ".";
+    }
+    out += part;
+  }
+  return out.empty() ? "(root)" : out;
+}
+
+// Counts a cut and remembers the path of the first one of its kind
+static void RecordCut(v8::Isolate *isolate, const SanitizeState &state,
+                      uint32_t &count, std::string &first_path) {
+  if (count++ == 0) {
+    first_path = PathString(isolate, state);
+  }
+}
+
+static void AppendJsonString(std::string &out, const std::string &value) {
+  out += '"';
+  for (unsigned char c : value) {
+    switch (c) {
+    case '"':
+      out += "\\\"";
+      break;
+    case '\\':
+      out += "\\\\";
+      break;
+    default:
+      if (c < 0x20) {
+        char escaped[8];
+        snprintf(escaped, sizeof(escaped), "\\u%04x", c);
+        out += escaped;
+      } else {
+        out += static_cast<char>(c);
+      }
+    }
+  }
+  out += '"';
+}
+
+static void AppendCut(std::string &out, const char *name, uint32_t count,
+                      const std::string &first_path) {
+  out += ",\"";
+  out += name;
+  out += "\":{\"count\":" + std::to_string(count);
+  if (count > 0) {
+    out += ",\"firstPath\":";
+    AppendJsonString(out, first_path);
+  }
+  out += "}";
+}
+
+static int64_t NowMs() {
+  return duration_cast<milliseconds>(steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// Writes the diagnostics line described at kSlowStateMs. Depth and breadth
+// cuts are expected for large states (e.g. a Sentry client) and are logged with
+// severity INFO for the async state only; a used-up read or string budget, or
+// a slow serialization, is a WARNING.
+static void LogSerialization(const char *kind, const SanitizeState &state,
+                             double duration_ms) {
+  auto is_async_state = std::string(kind) == "asyncState";
+  auto is_warning = state.read_cuts > 0 || state.string_cuts > 0 ||
+                    duration_ms >= kSlowStateMs;
+  auto is_cut = state.depth_cuts > 0 || state.breadth_cuts > 0;
+  if (!is_warning && !(is_async_state && is_cut)) {
+    return;
+  }
+
+  static std::atomic<int64_t> last_async_log{0};
+  static std::atomic<int64_t> last_poll_log{0};
+  auto &last_log = is_async_state ? last_async_log : last_poll_log;
+  auto now = NowMs();
+  auto previous = last_log.load();
+  if ((previous != 0 && now - previous < kMinLogIntervalMs) ||
+      !last_log.compare_exchange_strong(previous, now)) {
+    return;
+  }
+
+  char duration_text[32];
+  snprintf(duration_text, sizeof(duration_text), "%.1f", duration_ms);
+  std::string line = "{\"severity\":\"";
+  line += is_warning ? "WARNING" : "INFO";
+  line += "\",\"message\":";
+  AppendJsonString(line, std::string("@sentry/node-native-stacktrace: ") +
+                             kind + " serialization " +
+                             (is_warning ? "used up its budget or was slow"
+                                         : "was cut by depth/breadth limits"));
+  line += ",\"sentryNativeStacktrace\":{\"state\":\"";
+  line += kind;
+  line += "\",\"durationMs\":";
+  line += duration_text;
+  line +=
+      ",\"reads\":" + std::to_string(kMaxStateNodes - state.remaining_nodes);
+  line += ",\"stringLength\":" +
+          std::to_string(kMaxStateStringLength - state.remaining_string_length);
+  AppendCut(line, "depthCuts", state.depth_cuts, state.first_depth_cut);
+  AppendCut(line, "breadthCuts", state.breadth_cuts, state.first_breadth_cut);
+  AppendCut(line, "readBudgetCuts", state.read_cuts, state.first_read_cut);
+  AppendCut(line, "stringBudgetCuts", state.string_cuts,
+            state.first_string_cut);
+  line += ",\"heavyPaths\":[";
+  for (size_t i = 0; i < state.heavy_paths.size(); ++i) {
+    if (i > 0) {
+      line += ",";
+    }
+    line += "{\"path\":";
+    AppendJsonString(line, state.heavy_paths[i].first);
+    line += ",\"reads\":" + std::to_string(state.heavy_paths[i].second) + "}";
+  }
+  line += "]}}\n";
+  fwrite(line.data(), 1, line.size(), stderr);
+  fflush(stderr);
+}
+
+// Serializes the value at the current path end and, for shallow paths,
+// remembers it if it used many reads
+static v8::Local<v8::Value> SanitizeChild(v8::Isolate *isolate,
+                                          v8::Local<v8::Context> context,
+                                          v8::Local<v8::Value> key,
+                                          v8::Local<v8::Value> value,
+                                          SanitizeState &state);
 
 // Creates one of the marker strings that replace cut-off data
 template <int N>
@@ -196,6 +377,7 @@ static v8::Local<v8::String> SanitizeString(v8::Isolate *isolate,
     return str;
   }
 
+  RecordCut(isolate, state, state.string_cuts, state.first_string_cut);
   auto prefix_length = state.remaining_string_length;
   state.remaining_string_length = 0;
   if (prefix_length == 0) {
@@ -284,6 +466,11 @@ static v8::Local<v8::Value> SanitizeForJSON(v8::Isolate *isolate,
 
   auto is_array = value->IsArray();
   if (state.ancestors.size() >= kMaxStateDepth || state.remaining_nodes == 0) {
+    if (state.remaining_nodes == 0) {
+      RecordCut(isolate, state, state.read_cuts, state.first_read_cut);
+    } else {
+      RecordCut(isolate, state, state.depth_cuts, state.first_depth_cut);
+    }
     return is_array ? Marker(isolate, "[Array]") : Marker(isolate, "[Object]");
   }
 
@@ -304,6 +491,7 @@ static v8::Local<v8::Value> SanitizeForJSON(v8::Isolate *isolate,
     uint32_t i = 0;
     for (; i < length && i < kMaxStateBreadth && !state.terminating; ++i) {
       if (!TakeNode(state)) {
+        RecordCut(isolate, state, state.read_cuts, state.first_read_cut);
         break;
       }
 
@@ -313,7 +501,9 @@ static v8::Local<v8::Value> SanitizeForJSON(v8::Isolate *isolate,
         continue; // omit entries that cannot be read
       }
 
-      auto sanitized = SanitizeForJSON(isolate, context, el, state);
+      auto sanitized =
+          SanitizeChild(isolate, context,
+                        v8::Integer::NewFromUnsigned(isolate, i), el, state);
       if (!sanitized->IsUndefined()) {
         out->CreateDataProperty(context, out_index++, sanitized)
             .FromMaybe(false); // omit undefined entries entirely
@@ -321,6 +511,9 @@ static v8::Local<v8::Value> SanitizeForJSON(v8::Isolate *isolate,
     }
 
     if (i < length && !state.terminating) {
+      if (i >= kMaxStateBreadth) {
+        RecordCut(isolate, state, state.breadth_cuts, state.first_breadth_cut);
+      }
       out->CreateDataProperty(context, out_index,
                               Marker(isolate, "[MaxProperties ~]"))
           .FromMaybe(false);
@@ -339,6 +532,7 @@ static v8::Local<v8::Value> SanitizeForJSON(v8::Isolate *isolate,
           v8::Object::New(isolate, v8::Null(isolate), nullptr, nullptr, 0);
       auto len = props->Length();
       if (len > kMaxStateBreadth) {
+        RecordCut(isolate, state, state.breadth_cuts, state.first_breadth_cut);
         // Collecting the keys costs O(len), so the keys that are not visited
         // are charged to the budget as well
         auto skipped = len - kMaxStateBreadth;
@@ -364,7 +558,14 @@ static v8::Local<v8::Value> SanitizeForJSON(v8::Isolate *isolate,
         state.remaining_string_length =
             key_fits ? state.remaining_string_length - key_length : 0;
 
-        if (!key_fits || i >= kMaxStateBreadth || !TakeNode(state)) {
+        auto has_read = key_fits && i < kMaxStateBreadth && TakeNode(state);
+        if (!has_read) {
+          if (!key_fits) {
+            RecordCut(isolate, state, state.string_cuts,
+                      state.first_string_cut);
+          } else if (i < kMaxStateBreadth) {
+            RecordCut(isolate, state, state.read_cuts, state.first_read_cut);
+          }
           // Cut the object here. The marker takes this key, or "..." if the
           // key itself does not fit into the string budget.
           out->CreateDataProperty(context,
@@ -380,7 +581,7 @@ static v8::Local<v8::Value> SanitizeForJSON(v8::Isolate *isolate,
           continue; // drop properties that cannot be read
         }
 
-        auto sanitized = SanitizeForJSON(isolate, context, val, state);
+        auto sanitized = SanitizeChild(isolate, context, key_str, val, state);
         if (!sanitized->IsUndefined()) {
           out->CreateDataProperty(context, key_str, sanitized).FromMaybe(false);
         }
@@ -399,8 +600,27 @@ static v8::Local<v8::Value> SanitizeForJSON(v8::Isolate *isolate,
   return result;
 }
 
-std::string JSONStringify(Isolate *isolate, Local<Value> value) {
+static v8::Local<v8::Value> SanitizeChild(v8::Isolate *isolate,
+                                          v8::Local<v8::Context> context,
+                                          v8::Local<v8::Value> key,
+                                          v8::Local<v8::Value> value,
+                                          SanitizeState &state) {
+  state.path.push_back(key);
+  auto reads_before = state.remaining_nodes;
+  auto sanitized = SanitizeForJSON(isolate, context, value, state);
+  auto reads = reads_before - state.remaining_nodes;
+  if (state.path.size() <= kHeavyPathMaxKeys && reads >= kHeavyPathReads &&
+      state.heavy_paths.size() < kMaxHeavyPaths) {
+    state.heavy_paths.emplace_back(PathString(isolate, state), reads);
+  }
+  state.path.pop_back();
+  return sanitized;
+}
+
+std::string JSONStringify(Isolate *isolate, Local<Value> value,
+                          const char *kind) {
   auto context = isolate->GetCurrentContext();
+  auto started = steady_clock::now();
 
   // Exceptions thrown while reading the value (getters) are caught here, so
   // they never reach the JavaScript running on this thread
@@ -418,6 +638,10 @@ std::string JSONStringify(Isolate *isolate, Local<Value> value) {
     v8::String::Utf8Value utf8(isolate, json_str);
     json = *utf8 ? *utf8 : "";
   }
+
+  LogSerialization(
+      kind, state,
+      duration<double, std::milli>(steady_clock::now() - started).count());
 
   KeepTermination(isolate, try_catch);
   return json;
@@ -527,7 +751,7 @@ std::string GetThreadState(Isolate *isolate,
     root_store = current;
   }
 
-  return JSONStringify(isolate, root_store);
+  return JSONStringify(isolate, root_store, "asyncState");
 }
 #endif
 
@@ -894,7 +1118,7 @@ void ThreadPoll(const FunctionCallbackInfo<Value> &args) {
   std::string poll_state = "";
   if (args.Length() > 1 && args[1]->IsObject()) {
     auto obj = args[1].As<Object>();
-    poll_state = JSONStringify(isolate, obj);
+    poll_state = JSONStringify(isolate, obj, "pollState");
   }
 
   // First, find the thread without holding any lock (map reads are safe)
